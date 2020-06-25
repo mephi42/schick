@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e -u -x
+cd "$(dirname "$0")"
+files=$(git ls-files "*.hs")
+ormolu --mode inplace $files
+hlint $files
+cabal v2-build

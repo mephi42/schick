@@ -1,0 +1,4 @@
+.ghc.environment.*
+.idea/
+dist-newstyle/
+dist/
