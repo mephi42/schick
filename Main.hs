@@ -1,8 +1,25 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 module Main where
 
 import qualified Data.Map as Map (Map, empty, insert, lookup)
 import Data.Maybe (fromMaybe)
-import ShellCheck.AST (Id, InnerToken (..), Token (..), getId)
+import ShellCheck.AST
+  ( AssignmentMode (..),
+    Id,
+    InnerToken (..),
+    Token (..),
+    getId,
+    pattern T_Annotation,
+    pattern T_Assignment,
+    pattern T_Literal,
+    pattern T_NormalWord,
+    pattern T_Pipeline,
+    pattern T_Redirecting,
+    pattern T_Script,
+    pattern T_SimpleCommand,
+    pattern T_SingleQuoted,
+  )
 import ShellCheck.Interface
   ( ParseResult (..),
     ParseSpec (..),
@@ -20,36 +37,55 @@ sys =
       siGetConfig = const (return Nothing)
     }
 
-type TokenMap = Map.Map Id Token
-
-type EdgeMap = Map.Map Id [Token]
+data Link
+  = Sibling Token
+  | Parent Token
+  deriving (Show)
 
 data Cfg = Cfg
   { cfEntry :: Token,
-    cfTokenMap :: TokenMap,
-    cfSuccessors :: EdgeMap
+    cfLinks :: Map.Map Id Link
   }
   deriving (Show)
 
-insertTokens :: Token -> TokenMap -> TokenMap
-insertTokens token@(OuterToken id _) = Map.insert id token
+updateCfg :: Token -> Cfg -> Cfg
+updateCfg token cfg =
+  let link :: [Token] -> Cfg -> Cfg
+      link (t0 : t1 : ts) cfg =
+        let updatedLinks = Map.insert (getId t0) (Sibling t1) (cfLinks cfg)
+         in link (t1 : ts) (updateCfg t0 (cfg {cfLinks = updatedLinks}))
+      link [t0] cfg =
+        let updatedLinks = Map.insert (getId t0) (Parent token) (cfLinks cfg)
+         in updateCfg t0 (cfg {cfLinks = updatedLinks})
+      link [] cfg = cfg
+   in case token of
+        T_Annotation _ _ t -> link [t] cfg
+        T_Script _ _ ts -> link ts cfg
+        T_Pipeline _ [] [t] -> link [t] cfg
+        T_Redirecting _ [] t -> link [t] cfg
+        _ -> cfg
 
-pr2cfg :: ParseResult -> Maybe Cfg
-pr2cfg pr =
+buildCfg :: ParseResult -> Maybe Cfg
+buildCfg parseResult =
   fmap
     ( \root ->
-        Cfg
-          { cfEntry = root,
-            cfTokenMap = insertTokens root Map.empty,
-            cfSuccessors = Map.empty
-          }
+        updateCfg
+          root
+          ( Cfg
+              { cfEntry = root,
+                cfLinks = Map.empty
+              }
+          )
     )
-    (prRoot pr)
+    (prRoot parseResult)
 
-getSuccessors :: Cfg -> Token -> [Token]
-getSuccessors cfg token = fromMaybe [] (Map.lookup (getId token) (cfSuccessors cfg))
+getSuccessor :: Cfg -> Token -> Maybe Token
+getSuccessor cfg token = case Map.lookup (getId token) (cfLinks cfg) of
+  Just (Sibling sibling) -> Just sibling
+  Just (Parent parent) -> getSuccessor cfg parent
+  Nothing -> Nothing
 
-newtype Value = Literal String deriving (Show)
+data Value = Literal String | Any Token deriving (Show)
 
 data State = State
   { stCurrent :: Token,
@@ -90,13 +126,32 @@ mergeExplorationStates state1 state2 =
       exFailed = exFailed state1 ++ exFailed state2
     }
 
+assign :: String -> Token -> State -> State
+assign var t state =
+  let val = case t of
+        T_Literal _ val -> Literal val
+        T_NormalWord _ [T_Literal _ val] -> Literal val
+        T_NormalWord _ [T_SingleQuoted _ val] -> Literal val
+        _ -> Any t
+   in state {stVars = Map.insert var val (stVars state)}
+
 step :: Cfg -> State -> ExplorationState
-step cfg state = case getSuccessors cfg (stCurrent state) of
-  [successor] ->
-    newExplorationState
-      { exActive = [state {stCurrent = successor}]
-      }
-  _ -> newExplorationState {exFailed = [state]}
+step cfg state =
+  let currentToken = stCurrent state
+      ok :: State -> ExplorationState
+      ok state = case getSuccessor cfg currentToken of
+        Just link -> newExplorationState {exActive = [state {stCurrent = link}]}
+        Nothing -> newExplorationState {exDone = [state]}
+   in case currentToken of
+        T_Annotation _ _ t -> step cfg (state {stCurrent = t})
+        T_Script _ _ (t : _) -> step cfg (state {stCurrent = t})
+        T_Pipeline _ [] [t] -> step cfg (state {stCurrent = t})
+        T_Redirecting _ [] t -> step cfg (state {stCurrent = t})
+        T_SimpleCommand
+          _
+          [T_Assignment _ Assign var [] t]
+          [] -> ok (assign var t state)
+        _ -> newExplorationState {exFailed = [state]}
 
 exploreOnce :: Cfg -> ExplorationState -> ExplorationState
 exploreOnce cfg state =
@@ -111,15 +166,10 @@ main :: IO ()
 main = do
   contents <- readFile "gcc/config.gcc"
   parseResult <- parseScript sys newParseSpec {psScript = contents}
-  case pr2cfg parseResult of
+  case buildCfg parseResult of
     Just cfg ->
       let state =
-            explore
-              cfg
-              ( newExplorationState
-                  { exActive = [initialState cfg]
-                  }
-              )
+            explore cfg (newExplorationState {exActive = [initialState cfg]})
        in do
             putStrLn "Active:"
             mapM_ pPrint (exActive state)
