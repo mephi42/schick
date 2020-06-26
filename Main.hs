@@ -2,16 +2,28 @@
 
 module Main where
 
-import qualified Data.Map as Map (Map, empty, insert, lookup)
+import qualified Data.Map.Strict as Map
+  ( Map,
+    empty,
+    foldMapWithKey,
+    insert,
+    lookup,
+  )
 import Data.Maybe (fromMaybe)
+import Data.Text.Lazy (unpack)
 import ShellCheck.AST
   ( AssignmentMode (..),
+    CaseType (..),
     Id,
     InnerToken (..),
     Token (..),
     getId,
     pattern T_Annotation,
     pattern T_Assignment,
+    pattern T_CaseExpression,
+    pattern T_DollarBraced,
+    pattern T_DoubleQuoted,
+    pattern T_Glob,
     pattern T_Literal,
     pattern T_NormalWord,
     pattern T_Pipeline,
@@ -27,7 +39,7 @@ import ShellCheck.Interface
     newParseSpec,
   )
 import ShellCheck.Parser (parseScript)
-import Text.Pretty.Simple (pPrint)
+import Text.Pretty.Simple (pPrint, pShowNoColor)
 
 sys :: SystemInterface IO
 sys =
@@ -37,14 +49,20 @@ sys =
       siGetConfig = const (return Nothing)
     }
 
-data Link
-  = Sibling Token
-  | Parent Token
+data Link t
+  = Sibling t
+  | Parent t
   deriving (Show)
+
+instance Functor Link where
+  fmap f (Sibling t) = Sibling (f t)
+  fmap f (Parent t) = Parent (f t)
+
+type Links = Map.Map Id (Link Token)
 
 data Cfg = Cfg
   { cfEntry :: Token,
-    cfLinks :: Map.Map Id Link
+    cfLinks :: Links
   }
   deriving (Show)
 
@@ -58,11 +76,16 @@ updateCfg token cfg =
         let updatedLinks = Map.insert (getId t0) (Parent token) (cfLinks cfg)
          in updateCfg t0 (cfg {cfLinks = updatedLinks})
       link [] cfg = cfg
+      linkBranches :: [(CaseType, [Token], [Token])] -> Cfg -> Cfg
+      linkBranches ((CaseBreak, _, ts) : otherBranches) cfg =
+        linkBranches otherBranches (link ts cfg)
+      linkBranches [] cfg = cfg
    in case token of
         T_Annotation _ _ t -> link [t] cfg
         T_Script _ _ ts -> link ts cfg
         T_Pipeline _ [] [t] -> link [t] cfg
         T_Redirecting _ [] t -> link [t] cfg
+        T_CaseExpression _ _ branches -> linkBranches branches cfg
         _ -> cfg
 
 buildCfg :: ParseResult -> Maybe Cfg
@@ -85,11 +108,20 @@ getSuccessor cfg token = case Map.lookup (getId token) (cfLinks cfg) of
   Just (Parent parent) -> getSuccessor cfg parent
   Nothing -> Nothing
 
-data Value = Literal String | Any Token deriving (Show)
+data Value
+  = Lit String
+  | Var String
+  | Glob String
+  | Concat [Value]
+  | Matches Value Value
+  | Not Value
+  | Any Token
+  deriving (Show)
 
 data State = State
   { stCurrent :: Token,
-    stVars :: Map.Map String Value
+    stVars :: Map.Map String Value,
+    stConstraints :: [Value]
   }
   deriving (Show)
 
@@ -97,7 +129,8 @@ initialState :: Cfg -> State
 initialState cfg =
   State
     { stCurrent = cfEntry cfg,
-      stVars = Map.empty
+      stVars = Map.empty,
+      stConstraints = []
     }
 
 data ExplorationState = ExplorationState
@@ -115,6 +148,18 @@ newExplorationState =
       exFailed = []
     }
 
+addActive :: State -> ExplorationState -> ExplorationState
+addActive state explorationState =
+  explorationState
+    { exActive = state : exActive explorationState
+    }
+
+addDone :: State -> ExplorationState -> ExplorationState
+addDone state explorationState =
+  explorationState
+    { exDone = state : exDone explorationState
+    }
+
 mergeExplorationStates ::
   ExplorationState ->
   ExplorationState ->
@@ -126,21 +171,97 @@ mergeExplorationStates state1 state2 =
       exFailed = exFailed state1 ++ exFailed state2
     }
 
+evalVar :: String -> State -> Value
+evalVar var state = case Map.lookup var (stVars state) of
+  Just val -> val
+  Nothing -> Var var
+
+concat' :: [Value] -> Value
+concat' [t0] = t0
+concat' ts = Concat ts
+
+eval :: Token -> State -> Value
+eval token state = case token of
+  T_Literal _ val -> Lit val
+  T_SingleQuoted _ val -> Lit val
+  T_Glob _ val -> Glob val
+  T_NormalWord _ parts -> concat' (map (`eval` state) parts)
+  T_DoubleQuoted
+    _
+    [ T_DollarBraced _ False (T_NormalWord _ [T_Literal _ var])
+      ] -> evalVar var state
+  T_DollarBraced _ True (T_NormalWord _ [T_Literal _ var]) -> evalVar var state
+  _ -> Any token
+
 assign :: String -> Token -> State -> State
-assign var t state =
-  let val = case t of
-        T_Literal _ val -> Literal val
-        T_NormalWord _ [T_Literal _ val] -> Literal val
-        T_NormalWord _ [T_SingleQuoted _ val] -> Literal val
-        _ -> Any t
+assign var token state =
+  let val = eval token state
    in state {stVars = Map.insert var val (stVars state)}
+
+forkCase ::
+  Maybe Token ->
+  Value ->
+  [(CaseType, [Token], [Token])] ->
+  [Value] ->
+  State ->
+  ExplorationState ->
+  ExplorationState
+forkCase maybeCaseSuccessor word branches constraints state explorationState =
+  let goToCaseSuccessor :: [Value] -> ExplorationState
+      goToCaseSuccessor constraints = case maybeCaseSuccessor of
+        Just caseSuccessor ->
+          addActive
+            ( state
+                { stCurrent = caseSuccessor,
+                  stConstraints = constraints
+                }
+            )
+            explorationState
+        Nothing ->
+          addDone
+            (state {stConstraints = constraints})
+            explorationState
+   in case branches of
+        (CaseBreak, pattern' : otherPatterns, tokens) : otherBranches ->
+          let matches = Matches word (eval pattern' state)
+           in forkCase
+                maybeCaseSuccessor
+                word
+                ((CaseBreak, otherPatterns, tokens) : otherBranches)
+                (Not matches : constraints)
+                state
+                ( case tokens of
+                    (token : _) ->
+                      addActive
+                        ( state
+                            { stCurrent = token,
+                              stConstraints = matches : constraints
+                            }
+                        )
+                        explorationState
+                    [] -> goToCaseSuccessor (matches : constraints)
+                )
+        (CaseBreak, [], _) : otherBranches ->
+          forkCase
+            maybeCaseSuccessor
+            word
+            otherBranches
+            constraints
+            state
+            explorationState
+        [] -> goToCaseSuccessor constraints
+        incomplete -> error (unpack (pShowNoColor incomplete))
 
 step :: Cfg -> State -> ExplorationState
 step cfg state =
   let currentToken = stCurrent state
+      maybeSuccessor = getSuccessor cfg currentToken
       ok :: State -> ExplorationState
-      ok state = case getSuccessor cfg currentToken of
-        Just link -> newExplorationState {exActive = [state {stCurrent = link}]}
+      ok state = case maybeSuccessor of
+        Just successor ->
+          newExplorationState
+            { exActive = [state {stCurrent = successor}]
+            }
         Nothing -> newExplorationState {exDone = [state]}
    in case currentToken of
         T_Annotation _ _ t -> step cfg (state {stCurrent = t})
@@ -151,6 +272,14 @@ step cfg state =
           _
           [T_Assignment _ Assign var [] t]
           [] -> ok (assign var t state)
+        T_CaseExpression _ word branches ->
+          forkCase
+            maybeSuccessor
+            (eval word state)
+            branches
+            (stConstraints state)
+            state
+            newExplorationState
         _ -> newExplorationState {exFailed = [state]}
 
 exploreOnce :: Cfg -> ExplorationState -> ExplorationState
@@ -162,6 +291,11 @@ explore :: Cfg -> ExplorationState -> ExplorationState
 explore cfg state =
   if null (exActive state) then state else explore cfg (exploreOnce cfg state)
 
+pPrintLinks :: Links -> IO ()
+pPrintLinks =
+  Map.foldMapWithKey
+    (\k v -> putStrLn (show k ++ " -> " ++ show (fmap getId v)))
+
 main :: IO ()
 main = do
   contents <- readFile "gcc/config.gcc"
@@ -171,6 +305,8 @@ main = do
       let state =
             explore cfg (newExplorationState {exActive = [initialState cfg]})
        in do
+            putStrLn "Links:"
+            pPrintLinks (cfLinks cfg)
             putStrLn "Active:"
             mapM_ pPrint (exActive state)
             putStrLn "Done:"
