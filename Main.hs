@@ -49,65 +49,6 @@ sys =
       siGetConfig = const (return Nothing)
     }
 
-data Link t
-  = Sibling t
-  | Parent t
-  deriving (Show)
-
-instance Functor Link where
-  fmap f (Sibling t) = Sibling (f t)
-  fmap f (Parent t) = Parent (f t)
-
-type Links = Map.Map Id (Link Token)
-
-data Cfg = Cfg
-  { cfEntry :: Token,
-    cfLinks :: Links
-  }
-  deriving (Show)
-
-updateCfg :: Token -> Cfg -> Cfg
-updateCfg token cfg =
-  let link :: [Token] -> Cfg -> Cfg
-      link (t0 : t1 : ts) cfg =
-        let updatedLinks = Map.insert (getId t0) (Sibling t1) (cfLinks cfg)
-         in link (t1 : ts) (updateCfg t0 (cfg {cfLinks = updatedLinks}))
-      link [t0] cfg =
-        let updatedLinks = Map.insert (getId t0) (Parent token) (cfLinks cfg)
-         in updateCfg t0 (cfg {cfLinks = updatedLinks})
-      link [] cfg = cfg
-      linkBranches :: [(CaseType, [Token], [Token])] -> Cfg -> Cfg
-      linkBranches ((CaseBreak, _, ts) : otherBranches) cfg =
-        linkBranches otherBranches (link ts cfg)
-      linkBranches [] cfg = cfg
-   in case token of
-        T_Annotation _ _ t -> link [t] cfg
-        T_Script _ _ ts -> link ts cfg
-        T_Pipeline _ [] [t] -> link [t] cfg
-        T_Redirecting _ [] t -> link [t] cfg
-        T_CaseExpression _ _ branches -> linkBranches branches cfg
-        _ -> cfg
-
-buildCfg :: ParseResult -> Maybe Cfg
-buildCfg parseResult =
-  fmap
-    ( \root ->
-        updateCfg
-          root
-          ( Cfg
-              { cfEntry = root,
-                cfLinks = Map.empty
-              }
-          )
-    )
-    (prRoot parseResult)
-
-getSuccessor :: Cfg -> Token -> Maybe Token
-getSuccessor cfg token = case Map.lookup (getId token) (cfLinks cfg) of
-  Just (Sibling sibling) -> Just sibling
-  Just (Parent parent) -> getSuccessor cfg parent
-  Nothing -> Nothing
-
 data Value
   = Lit String
   | Var String
@@ -118,27 +59,56 @@ data Value
   | Any Token
   deriving (Show)
 
-data State = State
-  { stCurrent :: Token,
+newtype LocBase t
+  = Block [t]
+  deriving (Show)
+
+instance Functor LocBase where
+  fmap f (Block ts) = Block (fmap f ts)
+
+type Loc = LocBase Token
+
+data StateBase t = State
+  { stStack :: [LocBase t],
     stVars :: Map.Map String Value,
     stConstraints :: [Value]
   }
   deriving (Show)
 
-initialState :: Cfg -> State
-initialState cfg =
+instance Functor StateBase where
+  fmap f state =
+    State
+      { stStack = map (fmap f) (stStack state),
+        stVars = stVars state,
+        stConstraints = stConstraints state
+      }
+
+type State = StateBase Token
+
+initialState :: Token -> State
+initialState entry =
   State
-    { stCurrent = cfEntry cfg,
+    { stStack = [Block [entry]],
       stVars = Map.empty,
       stConstraints = []
     }
 
-data ExplorationState = ExplorationState
-  { exActive :: [State],
-    exDone :: [State],
-    exFailed :: [State]
+data ExplorationStateBase t = ExplorationState
+  { exActive :: [StateBase t],
+    exDone :: [StateBase t],
+    exFailed :: [StateBase t]
   }
   deriving (Show)
+
+instance Functor ExplorationStateBase where
+  fmap f explorationState =
+    ExplorationState
+      { exActive = map (fmap f) (exActive explorationState),
+        exDone = map (fmap f) (exDone explorationState),
+        exFailed = map (fmap f) (exFailed explorationState)
+      }
+
+type ExplorationState = ExplorationStateBase Token
 
 newExplorationState :: ExplorationState
 newExplorationState =
@@ -159,6 +129,9 @@ addDone state explorationState =
   explorationState
     { exDone = state : exDone explorationState
     }
+
+pushLoc :: Loc -> State -> State
+pushLoc loc state = state {stStack = loc : stStack state}
 
 mergeExplorationStates ::
   ExplorationState ->
@@ -199,118 +172,91 @@ assign var token state =
    in state {stVars = Map.insert var val (stVars state)}
 
 forkCase ::
-  Maybe Token ->
   Value ->
   [(CaseType, [Token], [Token])] ->
   [Value] ->
   State ->
   ExplorationState ->
   ExplorationState
-forkCase maybeCaseSuccessor word branches constraints state explorationState =
-  let goToCaseSuccessor :: [Value] -> ExplorationState
-      goToCaseSuccessor constraints = case maybeCaseSuccessor of
-        Just caseSuccessor ->
-          addActive
-            ( state
-                { stCurrent = caseSuccessor,
-                  stConstraints = constraints
-                }
-            )
-            explorationState
-        Nothing ->
-          addDone
-            (state {stConstraints = constraints})
-            explorationState
-   in case branches of
-        (CaseBreak, pattern' : otherPatterns, tokens) : otherBranches ->
-          let matches = Matches word (eval pattern' state)
-           in forkCase
-                maybeCaseSuccessor
-                word
-                ((CaseBreak, otherPatterns, tokens) : otherBranches)
-                (Not matches : constraints)
-                state
-                ( case tokens of
-                    (token : _) ->
-                      addActive
-                        ( state
-                            { stCurrent = token,
-                              stConstraints = matches : constraints
-                            }
-                        )
-                        explorationState
-                    [] -> goToCaseSuccessor (matches : constraints)
-                )
-        (CaseBreak, [], _) : otherBranches ->
-          forkCase
-            maybeCaseSuccessor
-            word
-            otherBranches
-            constraints
-            state
-            explorationState
-        [] -> goToCaseSuccessor constraints
-        incomplete -> error (unpack (pShowNoColor incomplete))
+forkCase word branches constraints state explorationState = case branches of
+  (CaseBreak, pattern' : otherPatterns, tokens) : otherBranches ->
+    let matches = Matches word (eval pattern' state)
+        branchState =
+          ( (pushLoc (Block tokens) state)
+              { stConstraints = matches : constraints
+              }
+          )
+     in forkCase
+          word
+          ((CaseBreak, otherPatterns, tokens) : otherBranches)
+          (Not matches : constraints)
+          state
+          (addActive branchState explorationState)
+  (CaseBreak, [], _) : otherBranches ->
+    forkCase
+      word
+      otherBranches
+      constraints
+      state
+      explorationState
+  [] -> addActive (state {stConstraints = constraints}) explorationState
+  incomplete -> error (unpack (pShowNoColor incomplete))
 
-step :: Cfg -> State -> ExplorationState
-step cfg state =
-  let currentToken = stCurrent state
-      maybeSuccessor = getSuccessor cfg currentToken
-      ok :: State -> ExplorationState
-      ok state = case maybeSuccessor of
-        Just successor ->
-          newExplorationState
-            { exActive = [state {stCurrent = successor}]
-            }
-        Nothing -> newExplorationState {exDone = [state]}
+stepWith :: Token -> State -> ExplorationState
+stepWith currentToken state =
+  let single :: State -> ExplorationState
+      single updatedState = newExplorationState {exActive = [updatedState]}
    in case currentToken of
-        T_Annotation _ _ t -> step cfg (state {stCurrent = t})
-        T_Script _ _ (t : _) -> step cfg (state {stCurrent = t})
-        T_Pipeline _ [] [t] -> step cfg (state {stCurrent = t})
-        T_Redirecting _ [] t -> step cfg (state {stCurrent = t})
-        T_SimpleCommand
-          _
-          [T_Assignment _ Assign var [] t]
-          [] -> ok (assign var t state)
+        T_Annotation _ _ t -> single (pushLoc (Block [t]) state)
+        T_Script _ _ ts -> single (pushLoc (Block ts) state)
+        T_Pipeline _ [] [t] -> single (pushLoc (Block [t]) state)
+        T_Redirecting _ [] t -> single (pushLoc (Block [t]) state)
+        T_SimpleCommand _ [T_Assignment _ Assign var [] t] [] ->
+          single (assign var t state)
         T_CaseExpression _ word branches ->
           forkCase
-            maybeSuccessor
             (eval word state)
             branches
             (stConstraints state)
             state
             newExplorationState
-        _ -> newExplorationState {exFailed = [state]}
+        _ ->
+          newExplorationState
+            { exFailed = [pushLoc (Block [currentToken]) state]
+            }
 
-exploreOnce :: Cfg -> ExplorationState -> ExplorationState
-exploreOnce cfg state =
-  let nextStates = map (step cfg) (exActive state)
+step :: State -> ExplorationState
+step state =
+  case stStack state of
+    (Block (t : ts) : rest) -> stepWith t (state {stStack = Block ts : rest})
+    ((Block []) : rest) -> step (state {stStack = rest})
+    [] -> newExplorationState {exDone = [state]}
+
+exploreOnce :: ExplorationState -> ExplorationState
+exploreOnce state =
+  let nextStates = map step (exActive state)
    in foldl mergeExplorationStates (state {exActive = []}) nextStates
 
-explore :: Cfg -> ExplorationState -> ExplorationState
-explore cfg state =
-  if null (exActive state) then state else explore cfg (exploreOnce cfg state)
-
-pPrintLinks :: Links -> IO ()
-pPrintLinks =
-  Map.foldMapWithKey
-    (\k v -> putStrLn (show k ++ " -> " ++ show (fmap getId v)))
+explore :: ExplorationState -> ExplorationState
+explore state =
+  if null (exActive state) then state else explore (exploreOnce state)
 
 main :: IO ()
 main = do
   contents <- readFile "gcc/config.gcc"
   parseResult <- parseScript sys newParseSpec {psScript = contents}
-  case buildCfg parseResult of
-    Just cfg ->
+  case prRoot parseResult of
+    Just root ->
       let state =
-            explore cfg (newExplorationState {exActive = [initialState cfg]})
+            explore (newExplorationState {exActive = [initialState root]})
+          dump = fmap getId state
        in do
-            putStrLn "Links:"
-            pPrintLinks (cfLinks cfg)
+            putStrLn "Root:"
+            pPrint root
             putStrLn "Active:"
-            mapM_ pPrint (exActive state)
+            mapM_ pPrint (exActive dump)
             putStrLn "Done:"
-            mapM_ pPrint (exDone state)
+            mapM_ pPrint (exDone dump)
             putStrLn "Failed:"
-            mapM_ pPrint (exFailed state)
+            mapM_ pPrint (exFailed dump)
     Nothing -> putStrLn "Couldn't parse"
