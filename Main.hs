@@ -2,6 +2,7 @@
 
 module Main where
 
+import Data.Bifunctor (bimap)
 import qualified Data.Map.Strict as Map
   ( Map,
     empty,
@@ -24,6 +25,7 @@ import ShellCheck.AST
     pattern T_DollarBraced,
     pattern T_DoubleQuoted,
     pattern T_Glob,
+    pattern T_IfExpression,
     pattern T_Literal,
     pattern T_NormalWord,
     pattern T_Pipeline,
@@ -39,6 +41,7 @@ import ShellCheck.Interface
     newParseSpec,
   )
 import ShellCheck.Parser (parseScript)
+import System.Environment (getArgs)
 import Text.Pretty.Simple (pPrint, pShowNoColor)
 
 sys :: SystemInterface IO
@@ -56,15 +59,22 @@ data Value
   | Concat [Value]
   | Matches Value Value
   | Not Value
+  | Eq Value Value
   | Any Token
   deriving (Show)
 
-newtype LocBase t
+data LocBase t
   = Block [t]
+  | If [t] [([t], [t])] [t]
   deriving (Show)
 
 instance Functor LocBase where
   fmap f (Block ts) = Block (fmap f ts)
+  fmap f (If thenBranch elifBranches elseBranch) =
+    If
+      (fmap f thenBranch)
+      (map (bimap (fmap f) (fmap f)) elifBranches)
+      (fmap f elseBranch)
 
 type Loc = LocBase Token
 
@@ -213,6 +223,10 @@ stepWith currentToken state =
         T_Redirecting _ [] t -> single (pushLoc (Block [t]) state)
         T_SimpleCommand _ [T_Assignment _ Assign var [] t] [] ->
           single (assign var t state)
+        -- TODO: store command
+        -- TODO: update $?
+        -- TODO: check for exit
+        T_SimpleCommand _ [] _ -> single state
         T_CaseExpression _ word branches ->
           forkCase
             (eval word state)
@@ -220,6 +234,9 @@ stepWith currentToken state =
             (stConstraints state)
             state
             newExplorationState
+        T_IfExpression _ ((c, t) : elifBranches) elseBranch ->
+          let state' = pushLoc (If t elifBranches elseBranch) state
+           in single (pushLoc (Block c) state')
         _ ->
           newExplorationState
             { exFailed = [pushLoc (Block [currentToken]) state]
@@ -228,8 +245,31 @@ stepWith currentToken state =
 step :: State -> ExplorationState
 step state =
   case stStack state of
-    (Block (t : ts) : rest) -> stepWith t (state {stStack = Block ts : rest})
-    ((Block []) : rest) -> step (state {stStack = rest})
+    Block (t : ts) : rest -> stepWith t (state {stStack = Block ts : rest})
+    Block [] : rest -> step (state {stStack = rest})
+    If thenBranch elifBranches elseBranch : rest ->
+      let cond = Eq (evalVar "?" state) (Lit "0")
+          notCond = Not cond
+          thenFork =
+            state
+              { stStack = Block thenBranch : rest,
+                stConstraints = cond : stConstraints state
+              }
+          elseFork = case elifBranches of
+            ((c, t) : otherElifBranches) ->
+              state
+                { stStack =
+                    Block c :
+                    If t otherElifBranches elseBranch :
+                    rest,
+                  stConstraints = notCond : stConstraints state
+                }
+            [] ->
+              state
+                { stStack = Block elseBranch : rest,
+                  stConstraints = notCond : stConstraints state
+                }
+       in newExplorationState {exActive = [thenFork, elseFork]}
     [] -> newExplorationState {exDone = [state]}
 
 exploreOnce :: ExplorationState -> ExplorationState
@@ -243,7 +283,8 @@ explore state =
 
 main :: IO ()
 main = do
-  contents <- readFile "gcc/config.gcc"
+  [path] <- getArgs
+  contents <- readFile path
   parseResult <- parseScript sys newParseSpec {psScript = contents}
   case prRoot parseResult of
     Just root ->

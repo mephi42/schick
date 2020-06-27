@@ -5,3 +5,6 @@ files=$(git ls-files "*.hs")
 ormolu --mode inplace $files
 hlint $files
 cabal v2-build
+for sample in test/*; do
+  cabal v2-run Schick "$sample"
+done
