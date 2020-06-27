@@ -6,17 +6,28 @@ import Data.Bifunctor (bimap)
 import qualified Data.Map.Strict as Map
   ( Map,
     empty,
-    foldMapWithKey,
     insert,
     lookup,
   )
-import Data.Maybe (fromMaybe)
 import Data.Text.Lazy (unpack)
+import Options.Applicative
+  ( Parser,
+    argument,
+    auto,
+    execParser,
+    fullDesc,
+    helper,
+    info,
+    long,
+    metavar,
+    option,
+    optional,
+    str,
+    (<**>),
+  )
 import ShellCheck.AST
   ( AssignmentMode (..),
     CaseType (..),
-    Id,
-    InnerToken (..),
     Token (..),
     getId,
     pattern T_Annotation,
@@ -41,7 +52,6 @@ import ShellCheck.Interface
     newParseSpec,
   )
 import ShellCheck.Parser (parseScript)
-import System.Environment (getArgs)
 import Text.Pretty.Simple (pPrint, pShowNoColor)
 
 sys :: SystemInterface IO
@@ -111,11 +121,11 @@ data ExplorationStateBase t = ExplorationState
   deriving (Show)
 
 instance Functor ExplorationStateBase where
-  fmap f explorationState =
+  fmap f state =
     ExplorationState
-      { exActive = map (fmap f) (exActive explorationState),
-        exDone = map (fmap f) (exDone explorationState),
-        exFailed = map (fmap f) (exFailed explorationState)
+      { exActive = map (fmap f) (exActive state),
+        exDone = map (fmap f) (exDone state),
+        exFailed = map (fmap f) (exFailed state)
       }
 
 type ExplorationState = ExplorationStateBase Token
@@ -217,10 +227,10 @@ stepWith currentToken state =
   let single :: State -> ExplorationState
       single updatedState = newExplorationState {exActive = [updatedState]}
    in case currentToken of
-        T_Annotation _ _ t -> single (pushLoc (Block [t]) state)
+        T_Annotation _ _ t -> stepWith t state
         T_Script _ _ ts -> single (pushLoc (Block ts) state)
-        T_Pipeline _ [] [t] -> single (pushLoc (Block [t]) state)
-        T_Redirecting _ [] t -> single (pushLoc (Block [t]) state)
+        T_Pipeline _ [] [t] -> stepWith t state
+        T_Redirecting _ [] t -> stepWith t state
         T_SimpleCommand _ [T_Assignment _ Assign var [] t] [] ->
           single (assign var t state)
         -- TODO: store command
@@ -277,19 +287,33 @@ exploreOnce state =
   let nextStates = map step (exActive state)
    in foldl mergeExplorationStates (state {exActive = []}) nextStates
 
-explore :: ExplorationState -> ExplorationState
-explore state =
-  if null (exActive state) then state else explore (exploreOnce state)
+explore :: Maybe Int -> ExplorationState -> ExplorationState
+explore maxActive state =
+  let nActive = length (exActive state)
+   in if nActive == 0 || maybe False (nActive >) maxActive
+        then state
+        else explore maxActive (exploreOnce state)
 
-main :: IO ()
-main = do
-  [path] <- getArgs
-  contents <- readFile path
+data Options = Options
+  { opPath :: String,
+    opMaxActive :: Maybe Int
+  }
+  deriving (Show)
+
+optionsParser :: Parser Options
+optionsParser =
+  Options
+    <$> argument str (metavar "PATH")
+    <*> optional (option auto (long "max-active"))
+
+mainImpl :: Options -> IO ()
+mainImpl options = do
+  contents <- readFile (opPath options)
   parseResult <- parseScript sys newParseSpec {psScript = contents}
   case prRoot parseResult of
     Just root ->
-      let state =
-            explore (newExplorationState {exActive = [initialState root]})
+      let initial = newExplorationState {exActive = [initialState root]}
+          state = explore (opMaxActive options) initial
           dump = fmap getId state
        in do
             putStrLn "Root:"
@@ -301,3 +325,6 @@ main = do
             putStrLn "Failed:"
             mapM_ pPrint (exFailed dump)
     Nothing -> putStrLn "Couldn't parse"
+
+main :: IO ()
+main = mainImpl =<< execParser (info (optionsParser <**> helper) fullDesc)
